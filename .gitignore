@@ -1,0 +1,67 @@
+# ...existing code...
+./data
+
+# Project data (ignore datasets / generated data)
+data/
+data/*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+venv.bak/
+
+# Logs / runtime files / caches
+*.log
+logs/
+
+*.sqlite3
+*.db
+tmp/
+temp/
+*.bak
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs / editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Environment files
+.env
+.env.*
+secrets/
+secret.key
+
+# Misc
+*.csv
+*.tsv
+*.parquet
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
