@@ -42,6 +42,24 @@ PATTERNS_PY = {
     r"\s+": " "
 }
 
+
+class RunningStats:
+    """Online mean/std using Welford's algorithm."""
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: float) -> Tuple[float, float]:
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        self.m2 += delta * (x - self.mean)
+        variance = self.m2 / (self.n - 1) if self.n > 1 else 0.0
+        std = variance ** 0.5
+        return self.mean, std
+
 # ==========================
 # Model definition
 # ==========================
@@ -196,7 +214,7 @@ def simulate_log_ingestion(base_dir: str = "data/kafka", topic_name: str = TOPIC
 # ==========================
 # Consumer: score and push to Elasticsearch
 # ==========================
-def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, es_hosts=ES_HOSTS, es_index: str = ES_INDEX, anomaly_threshold: Optional[float] = ANOMALY_THRESHOLD, status_every: int = 500, quiet: bool = False):
+def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, es_hosts=ES_HOSTS, es_index: str = ES_INDEX, anomaly_threshold: Optional[float] = ANOMALY_THRESHOLD, factor: float = 3.0, status_every: int = 500, quiet: bool = False):
     model, vocab, vocab_size, unk_id, pad_id, criterion = load_model_and_vocab()
     consumer = KafkaConsumer(
         topic_name,
@@ -211,6 +229,7 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
         logger.info("Consumer started; scoring and indexing")
     processed = 0
     anomalies = 0
+    stats = RunningStats()
     try:
         for message in consumer:
             payload = message.value
@@ -218,6 +237,13 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
             cleaned = clean_text(raw_log)
             ids = text_to_ids(cleaned, vocab, unk_id, pad_id, MAX_LEN)
             loss, _ = calculate_reconstruction_loss(model, ids, vocab_size, criterion, DEVICE)
+
+            mean, std = stats.update(loss)
+            dynamic_threshold = None
+            if anomaly_threshold is not None:
+                dynamic_threshold = anomaly_threshold
+            elif stats.n > 1:
+                dynamic_threshold = mean + factor * std
 
             doc = {
                 "raw_log": raw_log,
@@ -228,12 +254,17 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
                 "timestamp_received": payload.get("timestamp"),
                 "anomaly_score": loss,
             }
-            if anomaly_threshold is not None:
-                is_anomaly = loss > anomaly_threshold
+            is_anomaly = False
+            if dynamic_threshold is not None:
+                is_anomaly = loss > dynamic_threshold
                 doc["is_anomaly"] = is_anomaly
+                doc["threshold_used"] = dynamic_threshold
+                doc["mean_score"] = mean
+                doc["std_score"] = std
                 anomalies += int(is_anomaly)
 
             processed += 1
+
 
             try:
                 es.index(index=es_index, body=doc)
@@ -242,7 +273,7 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
 
             if status_every and processed % status_every == 0:
                 msg = f"Processed {processed} messages"
-                if anomaly_threshold is not None:
+                if dynamic_threshold is not None:
                     msg += f" | anomalies flagged: {anomalies}"
                 print(msg)
     except KeyboardInterrupt:
@@ -254,7 +285,7 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
             logger.info("Kafka consumer closed")
 
 
-def stream_all(base_dir: str = "data/kafka", delay_seconds: float = 0.01, batch_size: int = 1000, add_timestamp: bool = True, anomaly_threshold: Optional[float] = None):
+def stream_all(base_dir: str = "data/kafka", delay_seconds: float = 0.01, batch_size: int = 1000, add_timestamp: bool = True, anomaly_threshold: Optional[float] = None, factor: float = 3.0):
     ensure_topic_exists(TOPIC_NAME, num_partitions=1, replication_factor=1, bootstrap_servers=BOOTSTRAP_SERVERS)
 
     consumer_thread = threading.Thread(
@@ -265,6 +296,7 @@ def stream_all(base_dir: str = "data/kafka", delay_seconds: float = 0.01, batch_
             "es_hosts": ES_HOSTS,
             "es_index": ES_INDEX,
             "anomaly_threshold": anomaly_threshold,
+            "factor": factor,
             "status_every": 200,
             "quiet": True,
         },
@@ -306,14 +338,16 @@ if __name__ == "__main__":
     p_ingest.add_argument("--no-timestamp", action="store_true")
 
     p_consume = sub.add_parser("consume", help="Consume, score, and index to Elasticsearch")
-    p_consume.add_argument("--threshold", type=float, default=None, help="Anomaly threshold; if omitted, scores only")
+    p_consume.add_argument("--threshold", type=float, default=None, help="Anomaly threshold; if omitted, dynamic threshold is used")
+    p_consume.add_argument("--factor", type=float, default=3.0, help="Multiplier for std when using dynamic threshold (mean + factor*std)")
 
     p_stream = sub.add_parser("stream", help="Ensure topic, ingest, consume, and show minimal status")
     p_stream.add_argument("--base-dir", default="data/kafka")
     p_stream.add_argument("--delay", type=float, default=0.01)
     p_stream.add_argument("--batch", type=int, default=1000)
     p_stream.add_argument("--no-timestamp", action="store_true")
-    p_stream.add_argument("--threshold", type=float, default=None, help="Anomaly threshold; if omitted, scores only")
+    p_stream.add_argument("--threshold", type=float, default=None, help="Fixed anomaly threshold; if omitted, dynamic threshold is used")
+    p_stream.add_argument("--factor", type=float, default=3.0, help="Multiplier for std when using dynamic threshold (mean + factor*std)")
 
     args = parser.parse_args()
 
@@ -322,7 +356,7 @@ if __name__ == "__main__":
     elif args.cmd == "ingest":
         simulate_log_ingestion(base_dir=args.base_dir, topic_name=TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, delay_seconds=args.delay, batch_size=args.batch, add_timestamp=not args.no_timestamp)
     elif args.cmd == "consume":
-        consume_score_and_index(topic_name=TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, es_hosts=ES_HOSTS, es_index=ES_INDEX, anomaly_threshold=args.threshold)
+        consume_score_and_index(topic_name=TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, es_hosts=ES_HOSTS, es_index=ES_INDEX, anomaly_threshold=args.threshold, factor=args.factor)
     elif args.cmd == "stream":
         stream_all(
             base_dir=args.base_dir,
@@ -330,4 +364,5 @@ if __name__ == "__main__":
             batch_size=args.batch,
             add_timestamp=not args.no_timestamp,
             anomaly_threshold=args.threshold,
+            factor=args.factor,
         )
