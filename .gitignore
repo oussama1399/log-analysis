@@ -31,16 +31,18 @@ venv/
 ENV/
 .venv/
 venv.bak/
-
+*.pth
 # Logs / runtime files / caches
 *.log
 logs/
 
+checkpoints/
 *.sqlite3
 *.db
 tmp/
 temp/
 *.bak
+.vs/
 
 # Jupyter
 .ipynb_checkpoints
