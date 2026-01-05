@@ -158,6 +158,31 @@ def ensure_topic_exists(topic_name: str, num_partitions: int = 1, replication_fa
     finally:
         admin_client.close()
 
+
+def clear_topic_and_index(topic_name: str = TOPIC_NAME, es_hosts=ES_HOSTS, es_index: str = ES_INDEX, bootstrap_servers=BOOTSTRAP_SERVERS):
+    # Delete topic if exists
+    if isinstance(bootstrap_servers, list):
+        bs = ",".join(bootstrap_servers)
+    else:
+        bs = bootstrap_servers
+
+    admin_client = KafkaAdminClient(bootstrap_servers=bs)
+    try:
+        admin_client.delete_topics([topic_name])
+        logger.info("Topic %s deleted", topic_name)
+    except Exception as e:
+        logger.warning("Could not delete topic %s: %s", topic_name, e)
+    finally:
+        admin_client.close()
+
+    # Delete Elasticsearch index if exists
+    es = Elasticsearch(es_hosts)
+    try:
+        es.indices.delete(index=es_index, ignore=[404])
+        logger.info("Elasticsearch index %s deleted", es_index)
+    except Exception as e:
+        logger.warning("Could not delete ES index %s: %s", es_index, e)
+
 # ==========================
 # Producer: stream log files into Kafka
 # ==========================
@@ -349,6 +374,8 @@ if __name__ == "__main__":
     p_stream.add_argument("--threshold", type=float, default=None, help="Fixed anomaly threshold; if omitted, dynamic threshold is used")
     p_stream.add_argument("--factor", type=float, default=3.0, help="Multiplier for std when using dynamic threshold (mean + factor*std)")
 
+    p_clear = sub.add_parser("clear", help="Delete Kafka topic and Elasticsearch index")
+
     args = parser.parse_args()
 
     if args.cmd == "topic":
@@ -366,3 +393,5 @@ if __name__ == "__main__":
             anomaly_threshold=args.threshold,
             factor=args.factor,
         )
+    elif args.cmd == "clear":
+        clear_topic_and_index(topic_name=TOPIC_NAME, es_hosts=ES_HOSTS, es_index=ES_INDEX, bootstrap_servers=BOOTSTRAP_SERVERS)
