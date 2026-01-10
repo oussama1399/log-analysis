@@ -4,7 +4,11 @@ import os
 import re
 import time
 import threading
+from collections import deque, Counter
+from math import sqrt
 from typing import Dict, Tuple, Optional
+
+import requests
 
 import torch
 import torch.nn as nn
@@ -12,6 +16,7 @@ from kafka import KafkaProducer, KafkaConsumer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError, UnknownTopicOrPartitionError
 from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import NotFoundError
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -28,10 +33,14 @@ TOPIC_NAME = "mozilla-logs"
 BOOTSTRAP_SERVERS = ["localhost:9092"]
 ES_HOSTS = [{"host": "localhost", "port": 9200, "scheme": "http"}]
 ES_INDEX = "mozilla-clogs-index"
+ANALYZED_INDEX = "analyzed_anomalies"
 
 MAX_LEN = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ANOMALY_THRESHOLD = None  # set to a float to flag anomalies, otherwise scores only
+STRICT_THRESHOLD_DEFAULT = 3.5
+CONTEXT_K = 3
+NORMAL_BUFFER_MAX = 50000
 
 PATTERNS_PY = {
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z": "[TIMESTAMP_ISO]",
@@ -59,6 +68,211 @@ class RunningStats:
         variance = self.m2 / (self.n - 1) if self.n > 1 else 0.0
         std = variance ** 0.5
         return self.mean, std
+
+
+class SimpleDrain:
+    """Simplified Drain algorithm for log template extraction."""
+
+    def __init__(self, similarity_threshold=0.5, max_depth=4):
+        self.similarity_threshold = similarity_threshold
+        self.max_depth = max_depth
+        self.templates = {}  # template_id -> template_tokens
+        self.template_counter = 0
+
+    def tokenize(self, log_text: str):
+        """Split log into tokens."""
+        return log_text.split()
+
+    def get_similarity(self, tokens1, tokens2):
+        """Calculate similarity between two token sequences."""
+        if len(tokens1) != len(tokens2):
+            return 0.0
+        matches = sum(1 for t1, t2 in zip(tokens1, tokens2) if t1 == t2)
+        return matches / len(tokens1) if len(tokens1) > 0 else 0.0
+
+    def find_best_template(self, tokens):
+        """Find the best matching template for given tokens."""
+        best_template_id = None
+        best_similarity = 0.0
+
+        token_len = len(tokens)
+        for template_id, template_tokens in self.templates.items():
+            if len(template_tokens) == token_len:
+                similarity = self.get_similarity(tokens, template_tokens)
+                if similarity >= self.similarity_threshold and similarity > best_similarity:
+                    best_similarity = similarity
+                    best_template_id = template_id
+
+        return best_template_id, best_similarity
+
+    def create_template(self, tokens1, tokens2):
+        """Merge two token sequences into a template with wildcards."""
+        template = []
+        for t1, t2 in zip(tokens1, tokens2):
+            if t1 == t2:
+                template.append(t1)
+            else:
+                template.append("<*>")  # Wildcard for variable parts
+        return template
+
+    def extract_parameters(self, tokens, template_tokens):
+        """Extract variable parameters from tokens using template."""
+        parameters = []
+        for token, template_token in zip(tokens, template_tokens):
+            if template_token == "<*>":
+                parameters.append(token)
+        return parameters
+
+    def parse(self, log_text: str):
+        """Parse a log line and return (template_id, template_str, parameters)."""
+        tokens = self.tokenize(log_text)
+
+        if not tokens:
+            return None, "", []
+
+        template_id, similarity = self.find_best_template(tokens)
+
+        if template_id is not None:
+            template_tokens = self.templates[template_id]
+            parameters = self.extract_parameters(tokens, template_tokens)
+            template_str = " ".join(template_tokens)
+            return template_id, template_str, parameters
+        else:
+            self.template_counter += 1
+            template_id = self.template_counter
+            self.templates[template_id] = tokens.copy()
+            template_str = " ".join(tokens)
+            parameters = []
+            return template_id, template_str, parameters
+
+    def update_template(self, template_id, new_tokens):
+        """Update an existing template by merging with new tokens."""
+        if template_id in self.templates:
+            old_template = self.templates[template_id]
+            merged_template = self.create_template(old_template, new_tokens)
+            self.templates[template_id] = merged_template
+
+
+def tokenize_simple(text: str):
+    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+
+
+def bow_counter(text: str) -> Counter:
+    return Counter(tokenize_simple(text))
+
+
+def cosine_counter(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    # Dot product
+    keys = a.keys() & b.keys()
+    dot = sum(a[k] * b[k] for k in keys)
+    na = sqrt(sum(v * v for v in a.values()))
+    nb = sqrt(sum(v * v for v in b.values()))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _ollama_url() -> str:
+    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    if not host.startswith("http"):
+        host = "http://" + host
+    return host.rstrip("/") + "/api/generate"
+
+
+def check_ollama_available(model: str = "gpt-oss:20b", timeout: int = 15) -> bool:
+    url = _ollama_url()
+    try:
+        resp = requests.post(
+            url,
+            json={"model": model, "prompt": "ping", "stream": False},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error("LLM not available at %s: %s", url, e)
+        return False
+
+
+def ollama_llm_analysis(
+    anomaly_log: str,
+    contexts: list,
+    model: str = "gpt-oss:20b",
+    timeout: int = 120,
+) -> Dict:
+    url = _ollama_url()
+
+    prompt_lines = [
+        "You are a log analysis assistant.",
+        "Given one anomalous log line and up to three normal context lines, return JSON only.",
+        "JSON schema: {\"llm_class\": string, \"llm_root_cause\": string, \"llm_suggested_fix\": string, \"llm_confidence\": number between 0 and 1}.",
+        "If you are unsure, set llm_class to 'needs_review', llm_confidence to 0, and provide a brief root_cause explaining uncertainty.",
+        "",
+        "Anomaly:",
+        anomaly_log,
+        "",
+        "Contexts:",
+    ]
+    for i, ctx in enumerate(contexts[:3], 1):
+        prompt_lines.append(f"{i}. {ctx.get('cleaned_log', '')}")
+    prompt_lines.append("")
+    prompt_lines.append("Return JSON only:")
+    prompt_str = "\n".join(prompt_lines)
+
+    default_resp = {
+        "llm_class": "needs_review",
+        "llm_root_cause": "llm_error",
+        "llm_suggested_fix": "Review manually.",
+        "llm_confidence": 0.0,
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "model": model,
+                "prompt": prompt_str,
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("response", "").strip()
+        parsed = None
+        if text:
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, dict):
+            return {
+                "llm_class": parsed.get("llm_class", default_resp["llm_class"]),
+                "llm_root_cause": parsed.get("llm_root_cause", default_resp["llm_root_cause"]),
+                "llm_suggested_fix": parsed.get("llm_suggested_fix", default_resp["llm_suggested_fix"]),
+                "llm_confidence": float(parsed.get("llm_confidence", default_resp["llm_confidence"])),
+            }
+        fallback = default_resp.copy()
+        fallback["llm_root_cause"] = "llm_unparsed"
+        fallback["raw"] = text[:500]
+        return fallback
+    except Exception as e:
+        logger.warning("LLM call failed: %s", e)
+        fallback = default_resp.copy()
+        fallback["llm_root_cause"] = "llm_exception"
+        fallback["error"] = str(e)
+        return fallback
+
+def topk_similar(normals: deque, query_cleaned: str, k: int = CONTEXT_K):
+    query_vec = bow_counter(query_cleaned)
+    scored = []
+    for item in normals:
+        score = cosine_counter(query_vec, item["bow"])
+        scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [itm for _, itm in scored[:k]]
 
 # ==========================
 # Model definition
@@ -183,6 +397,71 @@ def clear_topic_and_index(topic_name: str = TOPIC_NAME, es_hosts=ES_HOSTS, es_in
     except Exception as e:
         logger.warning("Could not delete ES index %s: %s", es_index, e)
 
+
+def clear_analysis_index(es_hosts=ES_HOSTS, analyzed_index: str = ANALYZED_INDEX):
+    es = Elasticsearch(es_hosts)
+    try:
+        es.indices.delete(index=analyzed_index, ignore=[404])
+        logger.info("Elasticsearch index %s deleted", analyzed_index)
+    except Exception as e:
+        logger.warning("Could not delete ES index %s: %s", analyzed_index, e)
+
+# ==========================
+# Elasticsearch index helpers
+# ==========================
+def ensure_es_index_with_timestamp(es: Elasticsearch, index_name: str):
+    """Ensure the given index exists with '@timestamp' mapped as a date using epoch_millis.
+
+    If the index exists, attempt to put the mapping for '@timestamp' if missing.
+    """
+    try:
+        exists = es.indices.exists(index=index_name)
+    except Exception as e:
+        logger.error("ES exists check failed for %s: %s", index_name, e)
+        exists = False
+
+    base_mappings = {
+        "mappings": {
+            "properties": {
+                "@timestamp": {"type": "date", "format": "epoch_millis"},
+                "timestamp_received": {"type": "date", "format": "epoch_millis"},
+                "raw_log": {"type": "text"},
+                "cleaned_log": {"type": "text"},
+                "template_id": {"type": "integer"},
+                "template": {"type": "text"},
+                "parameters": {"type": "keyword"},
+                "num_parameters": {"type": "integer"},
+                "source_file": {"type": "keyword"},
+                "source_directory": {"type": "keyword"},
+                "line_number": {"type": "integer"},
+                "anomaly_score": {"type": "float"},
+                "is_anomaly": {"type": "boolean"},
+                "threshold_used": {"type": "float"},
+                "mean_score": {"type": "float"},
+                "std_score": {"type": "float"},
+                "strict_threshold": {"type": "float"},
+                "context_logs": {"type": "text"},
+                "context_templates": {"type": "text"},
+                "analysis": {"type": "object", "enabled": True},
+            }
+        }
+    }
+
+    if not exists:
+        try:
+            es.indices.create(index=index_name, **base_mappings)
+            logger.info("Created ES index %s with timestamp mapping", index_name)
+            return
+        except Exception as e:
+            logger.warning("Create index %s failed (may already exist): %s", index_name, e)
+
+    # Try to update mapping (idempotent if already present)
+    try:
+        es.indices.put_mapping(index=index_name, body=base_mappings["mappings"]) 
+        logger.info("Updated mapping for index %s", index_name)
+    except Exception as e:
+        logger.warning("Put mapping failed for %s: %s", index_name, e)
+
 # ==========================
 # Producer: stream log files into Kafka
 # ==========================
@@ -220,7 +499,8 @@ def simulate_log_ingestion(base_dir: str = "data/kafka", topic_name: str = TOPIC
                             "line_number": line_num,
                         }
                         if add_timestamp:
-                            msg["timestamp"] = time.time()
+                            # Epoch millis for ES '@timestamp' compatibility
+                            msg["timestamp"] = int(round(time.time() * 1000))
                         batch.append(msg)
                         if len(batch) >= batch_size:
                             for m in batch:
@@ -249,9 +529,12 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
         group_id="log_analysis_group",
     )
     es = Elasticsearch(es_hosts)
+    # Ensure ES index exists with proper timestamp mapping
+    ensure_es_index_with_timestamp(es, es_index)
+    drain_parser = SimpleDrain(similarity_threshold=0.5)
 
     if not quiet:
-        logger.info("Consumer started; scoring and indexing")
+        logger.info("Consumer started; scoring and indexing with Drain")
     processed = 0
     anomalies = 0
     stats = RunningStats()
@@ -260,7 +543,12 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
             payload = message.value
             raw_log = payload.get("raw_log", "")
             cleaned = clean_text(raw_log)
-            ids = text_to_ids(cleaned, vocab, unk_id, pad_id, MAX_LEN)
+            
+            # DRAIN: Extract template and parameters
+            template_id, template_str, parameters = drain_parser.parse(cleaned)
+            
+            # Use template for anomaly detection
+            ids = text_to_ids(template_str, vocab, unk_id, pad_id, MAX_LEN)
             loss, _ = calculate_reconstruction_loss(model, ids, vocab_size, criterion, DEVICE)
 
             mean, std = stats.update(loss)
@@ -270,13 +558,29 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
             elif stats.n > 1:
                 dynamic_threshold = mean + factor * std
 
+            # Normalize timestamp to epoch millis
+            ts_payload = payload.get("timestamp")
+            if isinstance(ts_payload, (int, float)):
+                # if seconds float, convert to millis
+                if ts_payload < 10_000_000_000:  # less than year ~2286 seconds threshold
+                    ts_millis = int(round(ts_payload * 1000))
+                else:
+                    ts_millis = int(ts_payload)
+            else:
+                ts_millis = int(round(time.time() * 1000))
+
             doc = {
                 "raw_log": raw_log,
                 "cleaned_log": cleaned,
+                "template_id": template_id,
+                "template": template_str,
+                "parameters": parameters,
+                "num_parameters": len(parameters),
                 "source_file": payload.get("source_file", "unknown"),
                 "source_directory": payload.get("source_directory", "unknown"),
                 "line_number": payload.get("line_number", -1),
-                "timestamp_received": payload.get("timestamp"),
+                "timestamp_received": ts_millis,
+                "@timestamp": ts_millis,
                 "anomaly_score": loss,
             }
             is_anomaly = False
@@ -345,6 +649,101 @@ def stream_all(base_dir: str = "data/kafka", delay_seconds: float = 0.01, batch_
     except KeyboardInterrupt:
         print("[stream] Stopping stream.")
 
+
+def consume_analyze(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOTSTRAP_SERVERS, es_hosts=ES_HOSTS, analyzed_index: str = ANALYZED_INDEX, strict_threshold: float = STRICT_THRESHOLD_DEFAULT, context_k: int = CONTEXT_K, max_normals: int = NORMAL_BUFFER_MAX):
+    if not check_ollama_available():
+        print("[analyze] LLM unavailable; stopping.")
+        return
+
+    model, vocab, vocab_size, unk_id, pad_id, criterion = load_model_and_vocab()
+    consumer = KafkaConsumer(
+        topic_name,
+        bootstrap_servers=bootstrap_servers,
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        auto_offset_reset="earliest",
+        group_id="log_analysis_analyze_group",
+    )
+    es = Elasticsearch(es_hosts)
+    # Ensure analyzed index exists with proper timestamp mapping
+    ensure_es_index_with_timestamp(es, analyzed_index)
+    drain_parser = SimpleDrain(similarity_threshold=0.5)
+
+    normals = deque(maxlen=max_normals)
+    processed = 0
+    anomalies = 0
+    print(f"[analyze] Running with Drain + strict threshold={strict_threshold}, context_k={context_k}, normals buffer={max_normals}")
+    try:
+        for message in consumer:
+            payload = message.value
+            raw_log = payload.get("raw_log", "")
+            cleaned = clean_text(raw_log)
+            
+            # DRAIN: Extract template and parameters
+            template_id, template_str, parameters = drain_parser.parse(cleaned)
+            
+            # Use template for anomaly detection
+            ids = text_to_ids(template_str, vocab, unk_id, pad_id, MAX_LEN)
+            loss, _ = calculate_reconstruction_loss(model, ids, vocab_size, criterion, DEVICE)
+
+            processed += 1
+
+            if loss <= strict_threshold:
+                normals.append({
+                    "cleaned_log": cleaned,
+                    "raw_log": raw_log,
+                    "template_id": template_id,
+                    "template": template_str,
+                    "bow": bow_counter(cleaned),
+                })
+                continue
+
+            anomalies += 1
+            contexts = topk_similar(normals, cleaned, k=context_k) if normals else []
+            analysis = ollama_llm_analysis(cleaned, contexts)
+
+            # Normalize timestamp to epoch millis
+            ts_payload = payload.get("timestamp")
+            if isinstance(ts_payload, (int, float)):
+                if ts_payload < 10_000_000_000:
+                    ts_millis = int(round(ts_payload * 1000))
+                else:
+                    ts_millis = int(ts_payload)
+            else:
+                ts_millis = int(round(time.time() * 1000))
+
+            doc = {
+                "raw_log": raw_log,
+                "cleaned_log": cleaned,
+                "template_id": template_id,
+                "template": template_str,
+                "parameters": parameters,
+                "num_parameters": len(parameters),
+                "anomaly_score": loss,
+                "strict_threshold": strict_threshold,
+                "is_anomaly": True,
+                "context_logs": [c.get("raw_log", "") for c in contexts],
+                "context_templates": [c.get("template", "") for c in contexts],
+                "analysis": analysis,
+                "source_file": payload.get("source_file", "unknown"),
+                "source_directory": payload.get("source_directory", "unknown"),
+                "line_number": payload.get("line_number", -1),
+                "timestamp_received": ts_millis,
+                "@timestamp": ts_millis,
+            }
+            try:
+                es.index(index=analyzed_index, body=doc)
+            except Exception as e:
+                logger.error("Elasticsearch index error (analyze): %s", e)
+
+            if processed % 200 == 0:
+                print(f"[analyze] processed={processed}, anomalies={anomalies}, normals_in_buffer={len(normals)}")
+
+    except KeyboardInterrupt:
+        print("[analyze] Interrupted by user")
+    finally:
+        consumer.close()
+        print("[analyze] Kafka consumer closed")
+
 # ==========================
 # Main entrypoints
 # ==========================
@@ -376,6 +775,13 @@ if __name__ == "__main__":
 
     p_clear = sub.add_parser("clear", help="Delete Kafka topic and Elasticsearch index")
 
+    p_analyze = sub.add_parser("analyze", help="Strict triage + context search + LLM stub to enriched index")
+    p_analyze.add_argument("--threshold", type=float, default=STRICT_THRESHOLD_DEFAULT, help="Strict anomaly threshold (score > threshold triggers analysis)")
+    p_analyze.add_argument("--context-k", type=int, default=CONTEXT_K, help="Number of normal contexts to retrieve")
+    p_analyze.add_argument("--max-normals", type=int, default=NORMAL_BUFFER_MAX, help="Max normal logs kept in buffer for context search")
+
+    p_clear_anal = sub.add_parser("clear-anal", help="Delete analyzed anomalies index")
+
     args = parser.parse_args()
 
     if args.cmd == "topic":
@@ -395,3 +801,15 @@ if __name__ == "__main__":
         )
     elif args.cmd == "clear":
         clear_topic_and_index(topic_name=TOPIC_NAME, es_hosts=ES_HOSTS, es_index=ES_INDEX, bootstrap_servers=BOOTSTRAP_SERVERS)
+    elif args.cmd == "analyze":
+        consume_analyze(
+            topic_name=TOPIC_NAME,
+            bootstrap_servers=BOOTSTRAP_SERVERS,
+            es_hosts=ES_HOSTS,
+            analyzed_index=ANALYZED_INDEX,
+            strict_threshold=args.threshold,
+            context_k=args.context_k,
+            max_normals=args.max_normals,
+        )
+    elif args.cmd == "clear-anal":
+        clear_analysis_index(es_hosts=ES_HOSTS, analyzed_index=ANALYZED_INDEX)
