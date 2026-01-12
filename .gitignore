@@ -44,6 +44,14 @@ temp/
 *.bak
 .vs/
 
+.tex 
+
+# LaTeX intermediate files
+*.aux
+*.bbl
+*.blg
+*.brf       
+
 # Jupyter
 .ipynb_checkpoints
 

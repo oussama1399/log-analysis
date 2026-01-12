@@ -17,6 +17,7 @@ from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError, UnknownTopicOrPartitionError
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import NotFoundError
+from sentence_transformers import SentenceTransformer
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -528,9 +529,29 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
         auto_offset_reset="earliest",
         group_id="log_analysis_group",
     )
+
     es = Elasticsearch(es_hosts)
     # Ensure ES index exists with proper timestamp mapping
     ensure_es_index_with_timestamp(es, es_index)
+    # Ensure vector index exists
+    VECTOR_INDEX = "mozillalogs_vectorized"
+    VECTOR_DIM = 384
+    if not es.indices.exists(index=VECTOR_INDEX):
+        es.indices.create(
+            index=VECTOR_INDEX,
+            body={
+                "mappings": {
+                    "properties": {
+                        "raw_log": {"type": "text"},
+                        "cleaned_log": {"type": "text"},
+                        "embedding": {"type": "dense_vector", "dims": VECTOR_DIM},
+                        # ...other fields as needed
+                    }
+                }
+            }
+        )
+    # Load embedding model
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
     drain_parser = SimpleDrain(similarity_threshold=0.5)
 
     if not quiet:
@@ -595,10 +616,21 @@ def consume_score_and_index(topic_name: str = TOPIC_NAME, bootstrap_servers=BOOT
             processed += 1
 
 
+
+            # Index in classic index
             try:
                 es.index(index=es_index, body=doc)
             except Exception as e:
                 logger.error("Elasticsearch index error: %s", e)
+
+            # Vectorize and index in vector index
+            try:
+                emb = embedder.encode([raw_log])[0]
+                vector_doc = doc.copy()
+                vector_doc["embedding"] = emb.tolist()
+                es.index(index=VECTOR_INDEX, body=vector_doc)
+            except Exception as e:
+                logger.error("Elasticsearch vector index error: %s", e)
 
             if status_every and processed % status_every == 0:
                 msg = f"Processed {processed} messages"
